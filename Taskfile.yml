@@ -1,0 +1,31 @@
+version: "3"
+
+# weft-proxy — Caddy build with the modules weft-agent's proxy plane
+# pokes at runtime (etcd3 storage). One binary, one CI workflow, no
+# xcaddy required.
+
+vars:
+  BIN: weft-proxy
+
+tasks:
+  build:
+    desc: Build the local binary
+    cmds:
+      - go build -trimpath -ldflags "-s -w" -o {{.BIN}} .
+
+  build-linux:
+    desc: Build linux/arm64 + linux/amd64 binaries under dist/
+    cmds:
+      - CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o dist/linux-arm64/{{.BIN}} .
+      - CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o dist/linux-amd64/{{.BIN}} .
+
+  vet:
+    desc: go vet
+    cmds:
+      - go vet ./...
+
+  version:
+    desc: Print the embedded Caddy version
+    deps: [build]
+    cmds:
+      - ./{{.BIN}} version
