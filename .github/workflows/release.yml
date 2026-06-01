@@ -6,6 +6,13 @@ name: release
 #
 # Trigger policy mirrors the rest of openweft: workflow_dispatch + tag
 # `v*` only, never push:main (per feedback_no_autopublish_dev).
+#
+# Supply-chain attestations: each tarball + per-arch image gets an
+# SPDX 2.3 JSON SBOM (Syft) cosign-attested as `spdxjson`, plus a
+# SLSA L3 provenance via slsa-framework/slsa-github-generator. See
+# the weft repo's docs/operations/cosign-verify.md for the verifier
+# commands ; the workflow path differs (this repo) but the identity
+# pinning pattern is identical.
 
 on:
   workflow_dispatch:
@@ -67,6 +74,8 @@ jobs:
     permissions:
       contents: write
       id-token: write
+    outputs:
+      hashes: ${{ steps.hashes.outputs.hashes }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -90,6 +99,28 @@ jobs:
           done
           ( cd stage && sha256sum *.tar.gz > SHA256SUMS )
 
+      - uses: anchore/sbom-action/download-syft@v0
+
+      - name: generate SBOMs (SPDX 2.3 JSON, per tarball)
+        # One SBOM per per-OS/arch tarball. We scan the per-arch
+        # build directory so the SBOM enumerates the Go modules
+        # baked into that arch.
+        run: |
+          set -euo pipefail
+          for d in dist/weft-proxy-*; do
+            name=$(basename "$d")
+            syft scan "dir:${d}" -o spdx-json="stage/${name}_${{ github.ref_name }}.tar.gz.spdx.json"
+          done
+
+      - name: compute SHA256SUMS hash for SLSA
+        # base64(sha256sum *.tar.gz) feeds the SLSA generic generator
+        # below ; one provenance attestation covers every tarball.
+        id: hashes
+        run: |
+          set -euo pipefail
+          cd stage
+          echo "hashes=$(sha256sum *.tar.gz | base64 -w0)" >>"$GITHUB_OUTPUT"
+
       - uses: sigstore/cosign-installer@v3
 
       - name: sign release artifacts (keyless)
@@ -110,6 +141,20 @@ jobs:
               "$f"
           done
 
+      - name: cosign-attest SBOMs (spdxjson predicate)
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          set -euo pipefail
+          cd stage
+          for f in *.tar.gz; do
+            cosign attest-blob --yes \
+              --predicate "${f}.spdx.json" \
+              --type spdxjson \
+              --output-attestation "${f}.spdx.intoto.jsonl" \
+              "$f"
+          done
+
       - name: create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -117,9 +162,27 @@ jobs:
             stage/*.tar.gz
             stage/*.tar.gz.sig
             stage/*.tar.gz.cert
+            stage/*.spdx.json
+            stage/*.spdx.intoto.jsonl
             stage/SHA256SUMS
           draft: true
           generate_release_notes: true
+
+  provenance-tarballs:
+    # SLSA L3 provenance for tarballs. The reusable workflow runs on
+    # an isolated ephemeral builder GitHub controls — that's what
+    # earns L3 ("builder identity non-falsifiable"). Drops a
+    # .intoto.jsonl alongside the existing draft release assets.
+    needs: release
+    permissions:
+      contents: write
+      id-token: write
+      actions: read
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.0.0
+    with:
+      base64-subjects: ${{ needs.release.outputs.hashes }}
+      upload-assets: true
+      draft-release: true
 
   image:
     needs: build
@@ -132,6 +195,9 @@ jobs:
       fail-fast: false
       matrix:
         arch: [amd64, arm64]
+    outputs:
+      image-amd64: ${{ steps.expose.outputs.image-amd64 }}
+      image-arm64: ${{ steps.expose.outputs.image-arm64 }}
     steps:
       - uses: actions/checkout@v4
 
@@ -183,6 +249,70 @@ jobs:
         run: |
           set -euo pipefail
           cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      - uses: anchore/sbom-action/download-syft@v0
+
+      - name: generate per-arch image SBOM (SPDX 2.3 JSON)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          syft scan "registry:${IMAGE}@${DIGEST}" \
+            -o spdx-json=weft-proxy-image-${{ matrix.arch }}.spdx.json
+
+      - name: cosign-attest image SBOM (spdxjson predicate)
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign attest --yes \
+            --predicate "weft-proxy-image-${{ matrix.arch }}.spdx.json" \
+            --type spdxjson \
+            "${IMAGE}@${DIGEST}"
+
+      - name: upload image SBOM to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: weft-proxy-image-${{ matrix.arch }}.spdx.json
+          draft: true
+
+      - name: expose digest for SLSA
+        id: expose
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          echo "image-${{ matrix.arch }}=${DIGEST#sha256:}" >>"$GITHUB_OUTPUT"
+
+  provenance-image-amd64:
+    needs: image
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      actions: read
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@v2.0.0
+    with:
+      image: ghcr.io/${{ github.repository_owner }}/weft-proxy
+      digest: sha256:${{ needs.image.outputs.image-amd64 }}
+      registry-username: ${{ github.actor }}
+    secrets:
+      registry-password: ${{ secrets.GITHUB_TOKEN }}
+
+  provenance-image-arm64:
+    needs: image
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      actions: read
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@v2.0.0
+    with:
+      image: ghcr.io/${{ github.repository_owner }}/weft-proxy
+      digest: sha256:${{ needs.image.outputs.image-arm64 }}
+      registry-username: ${{ github.actor }}
+    secrets:
+      registry-password: ${{ secrets.GITHUB_TOKEN }}
 
   manifest:
     needs: image
