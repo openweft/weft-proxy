@@ -1,3 +1,5 @@
+<p align="center"><img src="https://raw.githubusercontent.com/openweft/brand/main/social/openweft.png" alt="openweft" width="720"></p>
+
 # weft-proxy
 
 `weft-proxy` is the Caddy build weft-agent supervises when an operator
