@@ -1,6 +1,6 @@
 module github.com/openweft/weft-proxy
 
-go 1.26.1
+go 1.26.4
 
 require (
 	github.com/caddyserver/caddy/v2 v2.11.3
